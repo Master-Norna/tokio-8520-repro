@@ -1,12 +1,16 @@
 //! Reproduction for tokio#8520
-//! "UnixStream::shutdown is missing the TCP-side ENOTCONNECTED -> Ok normalization"
+//! "UnixStream::shutdown lacks the TCP-side ENOTCONNECTED -> Ok normalization (#4665)"
 //!
-//! macOS / Linux: a local peer accepts and then closes with SO_LINGER(0),
-//! which sends an RST immediately after the handshake -- the same state the
-//! original report hit. We then read() and shutdown() the socket and print
-//! every errno, so macOS and Linux can be compared side by side.
+//! Part 1 (the subject of #8520): Unix DOMAIN sockets. Runs the issue's
+//! repro (socketpair, peer half dropped) plus the variants tested on WSL2,
+//! and prints what shutdown(2) returns on each platform.
 //!
-//! Windows has no portable RST peer here; it just probes a closed port.
+//! Part 2 (context, the #4665 race): a TCP peer accepts and then closes
+//! with SO_LINGER(0), sending an RST right after the handshake; we then
+//! read() and shutdown() the socket. Shows that the raw ENOTCONN which
+//! tokio's TCP wrapper normalizes away is really reachable on macOS/Linux.
+//!
+//! Windows has no Unix domain sockets; it only probes a closed TCP port.
 
 use std::io::Read;
 use std::net::{Shutdown, TcpStream};
@@ -16,16 +20,83 @@ fn main() {
     println!("os: {}", std::env::consts::OS);
 
     #[cfg(unix)]
-    unix_case();
+    {
+        println!();
+        unix_socket_case(); // part 1: the actual subject of #8520
+        println!();
+        tcp_rst_case(); // part 2: context, the #4665 race on the TCP path
+    }
 
     #[cfg(not(unix))]
     windows_case();
 }
 
 #[cfg(unix)]
-fn unix_case() {
+fn report(label: &str, res: std::io::Result<()>) {
+    match res {
+        Ok(()) => println!("{label}: ok"),
+        Err(e) => println!(
+            "{label}: error {:?} (os errno {})",
+            e,
+            e.raw_os_error().unwrap_or(0)
+        ),
+    }
+}
+
+#[cfg(unix)]
+fn unix_socket_case() {
+    use std::io::Write;
+    use std::os::unix::io::FromRawFd;
+    use std::os::unix::net::UnixStream;
+
+    println!("-- part 1: unix domain sockets (subject of #8520) --");
+
+    // (a) the issue's exact repro: connected pair, then the peer half is gone.
+    let (a, b) = UnixStream::pair().expect("pair");
+    drop(b);
+    report("pair + drop(peer) -> shutdown(Both)", a.shutdown(Shutdown::Both));
+
+    // (b) shutdown after a read that hit the reset.
+    let (mut a, b) = UnixStream::pair().expect("pair");
+    drop(b);
+    let mut buf = [0u8; 1];
+    match a.read(&mut buf) {
+        Ok(0) => println!("  read after drop: clean EOF"),
+        Ok(n) => println!("  read after drop: read {} byte(s)", n),
+        Err(e) => println!(
+            "  read after drop: error {:?} (os errno {})",
+            e,
+            e.raw_os_error().unwrap_or(0)
+        ),
+    }
+    report("read-then shutdown(Both)", a.shutdown(Shutdown::Both));
+
+    // (c) shutdown after a write post-drop.
+    let (mut a, b) = UnixStream::pair().expect("pair");
+    drop(b);
+    match a.write(&[1]) {
+        Ok(n) => println!("  write after drop: wrote {} byte(s)", n),
+        Err(e) => println!(
+            "  write after drop: error {:?} (os errno {})",
+            e,
+            e.raw_os_error().unwrap_or(0)
+        ),
+    }
+    report("write-then shutdown(Both)", a.shutdown(Shutdown::Both));
+
+    // (d) never-connected socket: raw fd, never bound nor connected.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    assert!(fd >= 0, "socket(AF_UNIX)");
+    let sock = unsafe { UnixStream::from_raw_fd(fd) };
+    report("never-connected shutdown(Both)", sock.shutdown(Shutdown::Both));
+}
+
+#[cfg(unix)]
+fn tcp_rst_case() {
     use std::net::TcpListener;
     use std::os::unix::io::AsRawFd;
+
+    println!("-- part 2: TCP after RST (context: the #4665 race) --");
 
     // Peer thread: accept one connection, then reset it.
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -50,38 +121,26 @@ fn unix_case() {
     let mut stream = TcpStream::connect(addr).expect("connect");
     peer.join().expect("peer thread");
 
-    // Step 1: read from the reset socket.
     let mut buf = [0u8; 1];
     match stream.read(&mut buf) {
-        Ok(0) => println!("read: clean EOF"),
-        Ok(n) => println!("read: read {} byte(s)", n),
+        Ok(0) => println!("  read: clean EOF"),
+        Ok(n) => println!("  read: read {} byte(s)", n),
         Err(e) => println!(
-            "read: error {:?} (os errno {})",
+            "  read: error {:?} (os errno {})",
             e,
             e.raw_os_error().unwrap_or(0)
         ),
     }
 
-    // Step 2: the actual subject -- shutdown(2) with SHUT_WR, the syscall
-    // std::net::TcpStream::shutdown (and tokio's UnixStream::shutdown) wraps.
+    // The syscall std::net::TcpStream::shutdown (and tokio's TcpStream
+    // wrapper, which normalizes ENOTCONN -> Ok) ultimately runs.
     let rc = unsafe { libc::shutdown(stream.as_raw_fd(), libc::SHUT_WR) };
     println!(
-        "raw shutdown(SHUT_WR): rc={} last_os_error={:?}",
+        "  raw shutdown(SHUT_WR): rc={} last_os_error={:?}",
         rc,
         std::io::Error::last_os_error()
     );
-
-    // Step 3: what a std user actually sees.
-    match stream.shutdown(Shutdown::Write) {
-        Ok(()) => println!("std shutdown(Write): ok"),
-        Err(e) => println!(
-            "std shutdown(Write): error {:?} (os errno {})",
-            e,
-            e.raw_os_error().unwrap_or(0)
-        ),
-    }
-
-    println!("done");
+    println!("  done");
 }
 
 #[cfg(not(unix))]
