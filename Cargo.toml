@@ -1,0 +1,12 @@
+[package]
+name = "tokio-8520-shutdown-repro"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# unix 分支要用 libc::shutdown；Windows 上不参与编译
+libc = "0.2"
+
+[profile.release]
+# 出错时回溯更友好
+panic = "unwind"

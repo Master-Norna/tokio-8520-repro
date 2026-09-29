@@ -1,0 +1,31 @@
+name: tokio-8520-shutdown-repro
+
+# 手动触发就够了：Actions 页签 -> 选本工作流 -> Run workflow
+on:
+  workflow_dispatch:
+
+jobs:
+  repro:
+    strategy:
+      # 一个平台失败不要取消其他平台
+      fail-fast: false
+      matrix:
+        # macos-latest 目前 = macOS 26 (arm64)；如需旧系统可加 macos-15
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Platform info
+        shell: bash
+        run: |
+          echo "uname: $(uname -a)"
+          rustc --version
+
+      - name: Run repro
+        shell: bash
+        run: cargo run --release
